@@ -436,13 +436,14 @@ jobs:
               --arg url "${APK_URL}" \
               --arg zip "${ZIP_URL}" \
               --arg ver "${VERSION_NAME}/${VERSION_CODE}" \
-              '.url = $url | .version = $ver | .code = (.code // 200)' update.json)
+              '.url = $url | .zip = $zip | .version = $ver | .code = 200' update.json)
             echo "$TEMP_JSON" > update.json
           else
             jq -n \
               --arg url "${APK_URL}" \
+              --arg zip "${ZIP_URL}" \
               --arg ver "${VERSION_NAME}/${VERSION_CODE}" \
-              '{code: 200, url: $url, version: $ver, msg: "更新内容自动生成"}' > update.json
+              '{code: 200, url: $url, version: $ver, zip: $zip, msg: "没有关系更新日志 更新内容自动生成"}' > update.json
           fi
           echo "✅ update.json 生成成功！"
 
