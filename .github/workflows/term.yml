@@ -1,0 +1,475 @@
+name: 清澜终端 构建 - term 分支
+
+on:
+  push:
+    paths:
+      - 'push/term.txt'       # 检测到此文件更新时自动触发
+  workflow_dispatch:              # 支持手动触发
+    inputs:
+      secret_password:
+        description: '🔐 安全口令（手动运行必须输入正确密码）'
+        required: true
+        default: ''
+        type: string
+      force_download:
+        description: '是否强制重新下载远程源码/插件包？'
+        required: true
+        default: true
+        type: boolean
+      zip_url:
+        description: '远程源码/插件 ZIP 直链地址（留空则自动读取后台 TERM_ZIP_URL）'
+        required: false
+        default: ''
+        type: string
+      restore_commit:
+        description: '【可选】恢复指定的 Commit 记录 (留空或不填则跳过)'
+        required: false
+        default: ''
+        type: string
+      signing:
+        description: '签名模式: auto / signed / debug'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - signed
+          - debug
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# =============================================================
+# 全局变量配置区：共享共有仓库，通过 term 分支隔离
+# =============================================================
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  TARGET_REPO: "${{ secrets.DEFAULT_REPO || vars.DEFAULT_REPO || github.repository }}"
+  TARGET_BRANCH: "term"  # 专属于 term 项目的分支
+  DEFAULT_ZIP_URL: "${{ secrets.TERM_ZIP_URL || vars.TERM_ZIP_URL }}"
+
+jobs:
+  build:
+    name: Build Term Project (term branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      # ==========================================================
+      # 🛡️ 1. 安全校验：仅在手动触发时检查密码口令
+      # ==========================================================
+      - name: 验证安全口令
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          INPUT_PWD: "${{ github.event.inputs.secret_password }}"
+          REAL_PWD: "${{ secrets.WORKFLOW_RUN_PASSWORD }}"
+        run: |
+          if [ "$INPUT_PWD" != "$REAL_PWD" ]; then
+            echo "❌ 错误: 运行口令不正确！安全机制触发，工作流已终止。"
+            exit 1
+          else
+            echo "✅ 口令验证通过，开始执行 Term 分支编译流程..."
+          fi
+
+      # ==========================================================
+      # 📥 2. 尝试检出远程 term 分支；若不存在则直接创建空目录准备接收源码
+      # ==========================================================
+      - name: 检出 term 分支或准备空目录
+        run: |
+          set -e
+          echo "正在尝试从共享仓库 ${TARGET_REPO} 检出分支: ${TARGET_BRANCH} ..."
+          
+          if git clone --depth 1 --branch "${TARGET_BRANCH}" "https://x-access-token:${{ secrets.MY_GITHUB_TOKEN }}@github.com/${TARGET_REPO}.git" coreapp 2>/dev/null; then
+            echo "✅ 成功找到并检出远程 ${TARGET_BRANCH} 分支！"
+          else
+            echo "⚠️ 远程仓库中尚无 ${TARGET_BRANCH} 分支（首次运行），直接在本地建立全新工作目录..."
+            mkdir -p coreapp
+          fi
+
+      - name: 检查并恢复指定的 Commit (可选)
+        run: |
+          cd coreapp
+          RESTORE_HASH="${{ github.event.inputs.restore_commit }}"
+          RESTORE_HASH=$(echo "$RESTORE_HASH" | xargs)
+          
+          if [ -d ".git" ] && [ -n "$RESTORE_HASH" ]; then
+            echo "🔍 检测到输入了 Commit 恢复参数: $RESTORE_HASH"
+            echo "正在尝试将仓库硬重置到该 Commit..."
+            if git checkout "$RESTORE_HASH" 2>/dev/null || git reset --hard "$RESTORE_HASH"; then
+              echo "✅ 成功恢复到 Commit: $RESTORE_HASH"
+            else
+              echo "❌ 错误: 指定的 Commit ($RESTORE_HASH) 不存在或无效！"
+              exit 1
+            fi
+          else
+            echo "⏩ 跳过 Commit 恢复步骤。"
+          fi
+
+      # ==========================================================
+      # 🔄 3. 下载远程源码、解压同步到 coreapp 并校验 gradlew
+      # ==========================================================
+      - name: 拉取、解压并同步远程源码到 coreapp
+        continue-on-error: true
+        run: |
+          INPUT_URL="${{ github.event.inputs.zip_url }}"
+          TARGET_URL="${INPUT_URL:-${{ env.DEFAULT_ZIP_URL }}}"
+
+          if [ -z "$TARGET_URL" ]; then
+            echo "❌ 错误: 未检测到任何有效下载直链！"
+            exit 1
+          fi
+
+          echo "正在从远程直链下载最新源码压缩包: $TARGET_URL"
+          
+          MAX_RETRIES=2
+          RETRY_COUNT=0
+          SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "--- 第 $RETRY_COUNT 次下载尝试 ---"
+            
+            if curl -L --speed-time 60 --speed-limit 1 -o source.zip "$TARGET_URL"; then
+              if [ -s "source.zip" ]; then
+                echo "下载成功，且文件数据正常！"
+                SUCCESS=true
+                break
+              else
+                echo "警告: 下载完成但文件大小为 0，视为无效数据。"
+              fi
+            else
+              echo "警告: 下载中断。"
+            fi
+
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "将在 5 秒后进行重试..."
+              sleep 5
+            fi
+          done
+
+          if [ "$SUCCESS" = "false" ]; then
+            echo "❌ 错误: 下载远程源码超时或失败。"
+            exit 1
+          fi
+
+          echo "正在解压压缩包..."
+          rm -rf temp
+          unzip -q source.zip -d temp
+          rm -f source.zip
+          
+          echo "🔍 正在识别源码根目录..."
+          zippath="temp/"
+          
+          if [ ! -f "temp/gradlew" ] && [ ! -d "temp/app" ]; then
+            sub_one=$(find temp -maxdepth 2 -name "gradlew" -type f | head -n 1)
+            if [ -n "$sub_one" ]; then
+              zippath="$(dirname "$sub_one")/"
+            else
+              sub_app=$(find temp -maxdepth 2 -name "app" -type d | head -n 1)
+              if [ -n "$sub_app" ]; then
+                zippath="$(dirname "$sub_app")/"
+              fi
+            fi
+          fi
+
+          echo "✅ 最终确定的源码目录为: ${zippath}"
+           
+          if [ -n "$zippath" ] && [ -d "$zippath" ]; then
+            echo "正在将最新远程源码覆盖同步到 coreapp 目录（保留 .git 目录）..."
+            find coreapp -mindepth 1 ! -path 'coreapp/.git*' -exec rm -rf {} +
+            
+            shopt -s dotglob
+            rsync -av --exclude='.github' --exclude='.git' "$zippath" ./coreapp/
+            rm -rf temp
+            shopt -u dotglob
+          else
+            echo "❌ 错误: 未能在压缩包中找到有效的源码路径！"
+            exit 1
+          fi
+
+          # 📌 核心校验：在 coreapp 中寻找 gradlew，如果没有直接结束脚本
+          echo "🔍 正在校验 coreapp 目录下的 gradlew 文件..."
+          if [ ! -f "coreapp/gradlew" ]; then
+            echo "❌ 错误: coreapp 目录中未找到 gradlew 文件！脚本终止。"
+            exit 1
+          else
+            echo "✅ 校验通过: 成功在 coreapp 中找到 gradlew！"
+          fi
+
+      - name: 初始化运行环境并清理 Release
+        run: |
+          echo "清理源码库 release..."
+          rm -rf coreapp/release
+          
+          if [ -d ".github" ]; then
+              cp -rf .github .github_backup
+          fi
+
+          rsync -av --delete --exclude='coreapp' --exclude='release/*.zip' --exclude='*.apk' coreapp/ ./
+
+          if [ -d ".github_backup" ]; then
+              rm -rf .github
+              mv .github_backup .github
+          fi
+
+      # ==========================================================
+      # 🔑 4. 清理源码旧密钥并动态 Base64 解码生成统一密钥
+      # ==========================================================
+      - name: Decode Release Keystore
+        env:
+          TERM_KEYSTORE_BASE64: ${{ secrets.TERM_KEYSTORE_BASE64 || secrets.GULU_KEYSTORE_BASE64 }}
+        run: |
+          echo "🧹 正在清理源码中自带的旧密钥文件..."
+          rm -f *.jks app/*.jks coreapp/*.jks coreapp/app/*.jks *.keystore coreapp/*.keystore
+
+          if [ -n "${TERM_KEYSTORE_BASE64:-}" ]; then
+            echo "📌 检测到秘钥 Base64，正在解码生成 release.jks..."
+            echo "$TERM_KEYSTORE_BASE64" | base64 -d -i > "${{ github.workspace }}/release.jks"
+          else
+            echo "⚠️ 未配置秘钥 Base64，将自动生成 kgulu 统一签名..."
+            keytool -genkeypair -v \
+              -keystore "${{ github.workspace }}/release.jks" \
+              -alias kgulu \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass kgulu123 \
+              -keypass kgulu123 \
+              -dname "CN=kguluTerm, OU=Dev, O=kgulu, L=SZ, ST=GD, C=CN"
+          fi
+
+      - name: 设置 Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 接受 Android SDK 许可证
+        run: yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 赋予 Gradlew 执行权限
+        run: chmod +x gradlew
+
+      - name: 修复文件时间戳并清理 CMake 缓存 (修复 ninja manifest dirty)
+        run: |
+          find . -type f -not -path './.git/*' -not -path './coreapp/*' -not -path './release/*' -exec touch {} +
+          rm -rf app/.cxx app/build
+          echo "✅ 时间戳已统一，CMake 缓存已清理"
+
+      - name: 执行 Gradle 编译打包
+        env:
+          KGULU_STORE_PASS: kgulu123
+          KGULU_KEY_PASS: kgulu123
+          GULU_KEYSTORE: ${{ github.workspace }}/release.jks
+        run: |
+          set -eu
+          ./gradlew :app:assembleRelease --stacktrace --no-daemon --no-configuration-cache || ./gradlew :app:assembleDebug --stacktrace --no-daemon --no-configuration-cache
+
+      - name: 整理产物与版本信息
+        id: prep_release
+        run: |
+          set -e
+
+          GRADLE_FILE="coreapp/app/build.gradle.kts"
+          if [ ! -f "$GRADLE_FILE" ]; then
+            GRADLE_FILE="coreapp/app/build.gradle"
+          fi
+          if [ ! -f "$GRADLE_FILE" ]; then
+            GRADLE_FILE="app/build.gradle.kts"
+          fi
+
+          RAW_VERSION_NAME=$(grep -E 'versionName\s*=' "$GRADLE_FILE" 2>/dev/null | head -1 | sed -E 's/.*["'\ ']([^"'\ ']+)["'\ '].*/\1/' | tr -d '"'"'")
+          RAW_VERSION_CODE=$(grep -E 'versionCode\s*=' "$GRADLE_FILE" 2>/dev/null | head -1 | sed -E 's/.*[[:space:]]([0-9]+).*/\1/')
+          
+          VERSION_NAME=$(echo "$RAW_VERSION_NAME" | tr -cd '[:alnum:].-_')
+          VERSION_CODE=$(echo "$RAW_VERSION_CODE" | tr -cd '[:alnum:]')
+
+          if [ -z "$VERSION_NAME" ]; then VERSION_NAME="1.0.0"; fi
+          if [ -z "$VERSION_CODE" ]; then VERSION_CODE="1"; fi
+
+          CLEAN_VERSION_NAME=$(echo "$VERSION_NAME" | tr -d '.')
+          VERSION="${CLEAN_VERSION_NAME}-${VERSION_CODE}"
+          VERSIONS="v${VERSION_NAME}/${VERSION_CODE}"
+          TAG_NAME="v${VERSION_NAME}_${VERSION_CODE}"
+
+          APK_FILENAME="kgulu-term-${VERSION}.apk"
+          SOURCE_FILENAME="kgulu-term-source-${VERSION}.zip"
+          BOOTSTRAP_FILENAME="termux-bootstrap-${VERSION}.zip"
+          SSH_PACK_FILENAME="ssh-pack-${VERSION}.zip"
+
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "VERSIONS=${VERSIONS}" >> "$GITHUB_OUTPUT"
+          echo "APK_FILENAME=${APK_FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_FILENAME=${SOURCE_FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "BOOTSTRAP_FILENAME=${BOOTSTRAP_FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "SSH_PACK_FILENAME=${SSH_PACK_FILENAME}" >> "$GITHUB_OUTPUT"
+
+          if [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
+            SRC_APK="app/build/outputs/apk/release/app-release.apk"
+          elif [ -f "app/build/outputs/apk/debug/app-debug.apk" ]; then
+            SRC_APK="app/build/outputs/apk/debug/app-debug.apk"
+          else
+            SRC_APK=$(find app/build/outputs/apk/ -name "*.apk" | head -n 1)
+          fi
+
+          if [ -z "$SRC_APK" ] || [ ! -f "$SRC_APK" ]; then
+            echo "❌ 错误: 未能在 build 路径找到生成的 APK！"
+            exit 1
+          fi
+
+          mkdir -p release
+          cp "$SRC_APK" "release/${APK_FILENAME}"
+
+          if [ -f "app/src/main/assets/termux-bootstrap.zip" ]; then
+            cp "app/src/main/assets/termux-bootstrap.zip" "release/${BOOTSTRAP_FILENAME}"
+          fi
+          if [ -f "app/src/main/assets/ssh-pack.zip" ]; then
+            cp "app/src/main/assets/ssh-pack.zip" "release/${SSH_PACK_FILENAME}"
+          fi
+          
+          echo "🧹 正在清理 coreapp 中的编译缓存，确保源码包干净且体积小..."
+          cd coreapp
+          rm -rf app/build app/.cxx build .gradle .idea
+          
+          echo "📦 正在打包精简纯净源码（过滤掉所有构建缓存）..."
+          zip -rq "../release/${SOURCE_FILENAME}" . -x ".git/*" "release/*" "*.apk"
+          cd ..
+
+          echo "✅ 产物整理完毕！(Tag: ${TAG_NAME})"
+
+      - name: 🚀 使用 GitHub CLI 发布/更新 Release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ steps.prep_release.outputs.TAG_NAME }}"
+          VERSIONS="${{ steps.prep_release.outputs.VERSIONS }}"
+          
+          APK_FILE="release/${{ steps.prep_release.outputs.APK_FILENAME }}"
+          SOURCE_FILE="release/${{ steps.prep_release.outputs.SOURCE_FILENAME }}"
+          BOOTSTRAP_FILE="release/${{ steps.prep_release.outputs.BOOTSTRAP_FILENAME }}"
+          SSH_FILE="release/${{ steps.prep_release.outputs.SSH_PACK_FILENAME }}"
+
+          NOTES="📌 **kgulu终端 (kgulu.term) 自动构建完成**
+          * **应用版本**: \`${{ steps.prep_release.outputs.VERSIONS }}\`
+          * **构建模式**: \`纯净源码直出 (无 Patch)\`"
+
+          UPLOAD_FILES=("$APK_FILE" "$SOURCE_FILE")
+          [ -f "$BOOTSTRAP_FILE" ] && UPLOAD_FILES+=("$BOOTSTRAP_FILE")
+          [ -f "$SSH_FILE" ] && UPLOAD_FILES+=("$SSH_FILE")
+
+          if gh release view "$TAG_NAME" &>/dev/null; then
+            echo "📌 检测到同名标签 $TAG_NAME 的 Release 已存在，保留标签，开始覆盖上传同名附件..."
+            gh release upload "$TAG_NAME" "${UPLOAD_FILES[@]}" --clobber
+            gh release edit "$TAG_NAME" --title "kgulu终端构建发布 $VERSIONS" --notes "$NOTES"
+          else
+            echo "📌 标签 $TAG_NAME 尚不存在，正在创建新 Release 并上传附件..."
+            gh release create "$TAG_NAME" "${UPLOAD_FILES[@]}" \
+              --title "kgulu终端构建发布 $VERSIONS" \
+              --notes "$NOTES"
+          fi
+          echo "✅ GitHub Releases 发布/更新流程执行完毕！"
+
+      - name: Telegram 推送 APK
+        continue-on-error: true
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          VERSIONS="${{ steps.prep_release.outputs.VERSIONS }}"
+          APK_FILENAME="${{ steps.prep_release.outputs.APK_FILENAME }}"
+          
+          if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ]; then
+            echo "推送 APK 至 Telegram..."
+            FINAL_APK="release/${APK_FILENAME}"
+            FINAL_CAPTION="📌 kgulu终端构建完成: $VERSIONS"
+
+            if [ -f "$FINAL_APK" ]; then
+              curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendDocument" \
+                -F chat_id="$TG_CHAT_ID" \
+                -F document=@"$FINAL_APK" \
+                -F caption="$FINAL_CAPTION" || true
+              echo "✅ Telegram 推送执行完成"
+            else
+              echo "⚠️ 找不到需要推送的 APK 文件，跳过"
+            fi
+          else
+            echo "⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID Secrets，跳过推送"
+          fi
+
+      - name: GitHub API 直传 (推送到共有仓库的 term 分支)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+          REPO: "${{ env.TARGET_REPO }}"
+        run: |
+          cat << 'EOF_PY' > upload.py
+          import os, sys, base64, json, urllib.request
+
+          token = os.environ.get("GH_TOKEN")
+          repo = os.environ.get("REPO")
+          local_path = sys.argv[1]
+          remote_path = sys.argv[2]
+          message = sys.argv[3]
+
+          if not os.path.exists(local_path):
+              print(f"❌ 文件不存在: {local_path}")
+              sys.exit(0)
+
+          file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
+          print(f"正在尝试上传文件: {remote_path} ({file_size_mb:.2f} MB)")
+          api_url = f"https://api.github.com/repos/{repo}/contents/{remote_path}"
+          
+          sha = None
+          req = urllib.request.Request(api_url, headers={
+              "Authorization": f"token {token}",
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "Actions-Uploader"
+          })
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  res_data = json.loads(resp.read().decode("utf-8"))
+                  sha = res_data.get("sha")
+          except Exception:
+              pass
+
+          with open(local_path, "rb") as f:
+              content_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+          payload = {
+              "message": message,
+              "content": content_b64
+          }
+          if sha:
+              payload["sha"] = sha
+
+          put_req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), headers={
+              "Authorization": f"token {token}",
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "Actions-Uploader",
+              "Content-Type": "application/json"
+          }, method="PUT")
+
+          try:
+              with urllib.request.urlopen(put_req) as resp:
+                  print(f"✅ 成功上传: {remote_path} (HTTP {resp.status})")
+          except Exception as e:
+              print(f"⚠️ API 上传遇到问题（但不影响后续构建）: {remote_path} -> {e}")
+          EOF_PY
+
+          export GH_TOKEN
+          export REPO
+          
+          APK_FILENAME="${{ steps.prep_release.outputs.APK_FILENAME }}"
+          SOURCE_FILENAME="${{ steps.prep_release.outputs.SOURCE_FILENAME }}"
+
+          python3 upload.py "release/${APK_FILENAME}" "release/${APK_FILENAME}" "API Upload: ${APK_FILENAME}" || true
+          python3 upload.py "release/${SOURCE_FILENAME}" "release/${SOURCE_FILENAME}" "API Upload: ${SOURCE_FILENAME}" || true
+          
+          echo "✅ API 上传流程执行完毕！"

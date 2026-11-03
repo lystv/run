@@ -1,0 +1,507 @@
+name: Build KGulu APK & SourceZip to tg
+
+on:
+  push:
+    branches: [ "**" ]
+    paths:
+      - 'push/gulu.txt'
+  workflow_dispatch:
+    inputs:
+      secret_password:
+        description: '🔐 安全口令（手动运行必须输入正确密码）'
+        required: true
+        default: ''
+        type: string
+      download_zip:
+        description: '是否拉取并解压远程源码压缩包？'
+        required: true
+        default: true
+        type: boolean
+      clears:
+        description: '是否清空拉取仓库'
+        required: true
+        default: true
+        type: boolean
+      zip_url:
+        description: '远程 ZIP 压缩包的直链地址（留空则自动读取后台机密/变量）'
+        required: false
+        default: ''
+        type: string
+      signing:
+        description: 'Signing mode: auto / signed / debug'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - signed
+          - debug
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# =============================================================
+# 全局变量配置区：优先读取 Secrets，若无则读取 Variables
+# =============================================================
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  DEFAULT_REPO: "${{ secrets.DEFAULT_REPO }}"
+  DEFAULT_ZIP_URL: "${{ secrets.GULU_ZIP_URL }}"
+  RELEASE_BASE_URL: "${{ secrets.RELEASE_BASE_URL }}"
+
+jobs:
+  build:
+    name: Build and Upload via API
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      # ==========================================================
+      # 🛡️ 安全校验：仅在手动触发时检查密码口令
+      # ==========================================================
+      - name: Verify Workflow Password
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          INPUT_PWD: "${{ github.event.inputs.secret_password }}"
+          REAL_PWD: "${{ secrets.WORKFLOW_RUN_PASSWORD }}"
+        run: |
+          if [ "$INPUT_PWD" != "$REAL_PWD" ]; then
+            echo "❌ 错误: 运行口令不正确！安全机制触发，工作流已终止。"
+            exit 1
+          else
+            echo "✅ 口令验证通过，开始执行编译流程..."
+          fi
+
+      - name: Checkout Code to CoreApp
+        uses: actions/checkout@v4
+        with:
+          repository: '${{ env.DEFAULT_REPO }}'
+          token: ${{ secrets.MY_GITHUB_TOKEN }}
+          path: coreapp
+
+      - name: 清空已拉取的仓库（保留 Git 记录和 release 目录）
+        if: ${{ github.event_name == 'push' || github.event.inputs.clears == 'true' }}
+        run: |
+          echo "正在清空 coreapp 目录下的文件（保留 .git、release 和 .github）..."
+          find coreapp -mindepth 1 \( -path 'coreapp/.git' -o -path 'coreapp/.github' -o -path 'coreapp/release' \) -prune -o -exec rm -rf {} +
+          echo "清空完成！列出 coreapp 目录剩余文件夹和文件："
+          ls -a coreapp
+
+          if [ ! -d "coreapp/.git" ] || [ ! -f "coreapp/.git/HEAD" ]; then
+            echo "❌ 错误: 清空后 .git 目录或 .git/HEAD 缺失！安全机制触发，脚本终止。"
+            exit 1
+          else
+            echo "✅ 安全检查通过: .git 目录完好无损。"
+          fi
+
+      - name: 下载远程源码并git到项目仓库
+        if: ${{ github.event_name == 'push' || github.event.inputs.download_zip == 'true' }}
+        run: |
+          TARGET_URL="${{ github.event.inputs.zip_url }}"
+          if [ -z "$TARGET_URL" ]; then
+            TARGET_URL="${{ env.DEFAULT_ZIP_URL }}"
+          fi
+
+          echo "正在从以下地址下载压缩包: $TARGET_URL"
+          
+          MAX_RETRIES=2
+          RETRY_COUNT=0
+          SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "--- 第 $RETRY_COUNT 次下载尝试 ---"
+            
+            if curl -L --speed-time 60 --speed-limit 1 -o source.zip "$TARGET_URL"; then
+              if [ -s "source.zip" ]; then
+                echo "下载成功，且文件数据正常！"
+                SUCCESS=true
+                break
+              else
+                echo "警告: 下载完成但文件大小为 0，视为无效数据。"
+              fi
+            else
+              echo "警告: 下载中断（可能因 1 分钟内无数据传输超时或网络连接失败）。"
+            fi
+
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "下载未获取到有效数据，将在 5 秒后进行第 2 次（最后一次）重试..."
+              sleep 5
+            fi
+          done
+
+          if [ "$SUCCESS" = "false" ]; then
+            echo "❌ 错误: 经过两次尝试，均在 1 分钟内没有获得有效下载数据或超时，脚本终止。"
+            exit 1
+          fi
+
+          echo "正在解压压缩包..."
+          rm -rf temp
+          unzip -q source.zip -d temp
+          rm -f source.zip
+          
+          echo "🔍 正在通过 gradlew 智能识别压缩包内的项目源码根目录..."
+          zippath=""
+
+          gradlew_file=$(find temp -maxdepth 4 -name "gradlew" | head -n 1)
+
+          if [ -n "$gradlew_file" ]; then
+            zippath="$(dirname "$gradlew_file")/"
+          elif [ -f "temp/update.json" ]; then
+            zippath="temp/"
+          else
+            shopt -s nullglob
+            sub_dirs=(temp/*/)
+            shopt -u nullglob
+            if [ ${#sub_dirs[@]} -eq 1 ] && [ -d "${sub_dirs[0]}" ]; then
+              zippath="${sub_dirs[0]}"
+            else
+              zippath="temp/"
+            fi
+          fi
+
+          echo "✅ 智能识别完成，定位到的源码目录为: ${zippath}"
+           
+          if [ -n "$zippath" ] && [ -d "$zippath" ]; then
+            if [ ! -f "coreapp/.git/HEAD" ]; then
+              echo "coreapp 的 .git 不完整，重新 clone 仓库..."
+              rm -rf coreapp
+              git clone --depth 1 --branch "${GITHUB_REF_NAME:-main}" \
+                "https://x-access-token:${{ secrets.MY_GITHUB_TOKEN }}@github.com/${{ env.DEFAULT_REPO }}.git" coreapp
+            fi
+            echo "正在将内容复制到 coreapp 目录（严格排除 .github 和 .git）..."
+            shopt -s dotglob
+            rsync -av --exclude='.github' --exclude='.git' "$zippath" ./coreapp/
+            rm -rf temp
+            shopt -u dotglob
+          else
+            echo "❌ 错误: 未能在压缩包中找到包含 gradlew 的有效源码目录！"
+            exit 1
+          fi
+
+          cd coreapp
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.io"
+          
+          git remote set-url origin "https://x-access-token:${{ secrets.MY_GITHUB_TOKEN }}@github.com/${{ env.DEFAULT_REPO }}.git"
+
+          git add .
+          if git diff --staged --quiet; then
+            echo "没有发现文件变动。"
+          else
+            git commit -m "Auto-update source code from remote zip (force overwrite)"
+            git push || true
+          fi
+ 
+      - name: Init CoreApp Directory & Clean Release
+        run: |
+          echo "清理源码库 release..."
+          rm -rf coreapp/release
+          
+          if [ -d ".github" ]; then
+              cp -rf .github .github_backup
+          fi
+
+          rsync -av --delete --exclude='coreapp' --exclude='.github_backup' --exclude='*.zip' --exclude='*.apk' coreapp/ ./
+
+          if [ -d ".github_backup" ]; then
+              rm -rf .github
+              mv .github_backup .github
+          fi
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Accept Android SDK Licenses
+        run: yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        
+      - name: 安装 安卓 SDK & NDK
+        run: |
+          echo "正在清理残缺的预装 NDK 并重新安装指定版本..."
+          rm -rf "${ANDROID_SDK_ROOT}/ndk/27.0.12077973"
+
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;27.0.12077973"
+
+          NDK_PATH="${ANDROID_SDK_ROOT}/ndk/27.0.12077973"
+          if [ -d "$NDK_PATH" ] && [ ! -f "$NDK_PATH/source.properties" ]; then
+            echo "检测到 NDK 缺少 source.properties，正在自动生成..."
+            echo "Pkg.Revision = 27.0.12077973" > "$NDK_PATH/source.properties"
+          fi
+          
+          echo "SDK 组件预安装与修复步骤执行完毕。"
+
+      - name: 修复文件时间戳并彻底清理 CMake 缓存
+        run: |
+          find . -type f -not -path './.git/*' -not -path './release/*' -exec touch {} +
+          rm -rf app/.cxx app/build coreapp/app/.cxx coreapp/app/build coreapp/build
+          echo "✅ 缓存已彻底清空，CMake 路径已重置"
+
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x gradlew
+
+      - name: Resolve Signing Mode
+        id: mode
+        run: |
+          INPUT="${{ github.event.inputs.signing }}"
+          MODE="${INPUT:-auto}"
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "Selected signing mode: $MODE"
+
+      - name: Decode Release Keystore
+        if: ${{ steps.mode.outputs.mode != 'debug' }}
+        env:
+          GULU_KEYSTORE_BASE64: ${{ secrets.GULU_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "${GULU_KEYSTORE_BASE64:-}" ]; then
+            echo "$GULU_KEYSTORE_BASE64" | base64 -d -i > "${{ github.workspace }}/release.jks"
+          else
+            echo "GULU_KEYSTORE_BASE64 is not set, skipping keystore decode."
+          fi
+
+      - name: 构建打包 APK
+        env:
+          GULU_KEYSTORE: ${{ github.workspace }}/release.jks
+          GULU_KEYSTORE_PASSWORD: ${{ secrets.GULU_KEYSTORE_PASSWORD }}
+          GULU_KEY_ALIAS: ${{ secrets.GULU_KEY_ALIAS }}
+          GULU_KEY_PASSWORD: ${{ secrets.GULU_KEYSTORE_PASSWORD }}
+        run: |
+          set -eu
+          MODE="${{ steps.mode.outputs.mode }}"
+          case "$MODE" in
+            signed)
+              ./gradlew :app:assembleRelease --stacktrace
+              ;;
+            debug)
+              ./gradlew :app:assembleDebug --stacktrace
+              ;;
+            auto)
+              if [ -n "${GULU_KEYSTORE_PASSWORD:-}" ] && [ -f "${{ github.workspace }}/release.jks" ]; then
+                ./gradlew :app:assembleRelease --stacktrace
+              else
+                ./gradlew :app:assembleDebug --stacktrace
+              fi
+              ;;
+          esac
+
+      # ==========================================================
+      # 📦 流程一：产物归档、版本解析与打包准备
+      # ==========================================================
+      - name: 📦 准备编译产物与版本命名
+        id: package_prep
+        run: |
+          set -e
+          VERSION_NAME=$(grep 'versionName =' app/build.gradle.kts | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          VERSION_CODE=$(grep 'versionCode =' app/build.gradle.kts | head -1 | sed -E 's/.*[[:space:]]([0-9]+).*/\1/')
+          CLEAN_VERSION_NAME=$(echo "$VERSION_NAME" | tr -d '.')
+          VERSION="${CLEAN_VERSION_NAME}-${VERSION_CODE}"
+          VERSIONS="v${VERSION_NAME}/${VERSION_CODE}"
+          TAG_NAME="gulu-${CLEAN_VERSION_NAME}"
+          
+          APK_FILENAME="gulu-${VERSION}.apk"
+          SOURCE_FILENAME="gulu-source-${VERSION}.zip"
+          SOURCE_APK="gulu-${VERSION}.zip"
+
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "clean_version_name=$CLEAN_VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "apk_filename=$APK_FILENAME" >> $GITHUB_OUTPUT
+          echo "source_filename=$SOURCE_FILENAME" >> $GITHUB_OUTPUT
+          echo "source_apk=$SOURCE_APK" >> $GITHUB_OUTPUT
+
+          if [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
+            SRC_APK="app/build/outputs/apk/release/app-release.apk"
+          elif [ -f "app/build/outputs/apk/debug/app-debug.apk" ]; then
+            SRC_APK="app/build/outputs/apk/debug/app-debug.apk"
+          else
+            SRC_APK=$(find app/build/outputs/apk/ -name "*.apk" | head -n 1)
+          fi
+
+          if [ -z "$SRC_APK" ] || [ ! -f "$SRC_APK" ]; then
+            echo "错误: 没有找到任何编译好的 APK 文件！"
+            exit 1
+          fi
+
+          cp "$SRC_APK" "${APK_FILENAME}"
+
+          echo "正在打包纯净源码..."
+          cd coreapp
+          zip -rq "../${SOURCE_FILENAME}" . -x ".git/*" ".github/*" "gulu.md" "*.zip" "*.apk"
+          cd ..
+          
+          echo "正在组合打包源码和 apk..."
+          zip -rq "${SOURCE_APK}" "${APK_FILENAME}" "${SOURCE_FILENAME}"
+          rm -rf coreapp
+          echo "✅ 产物打包准备完成！"
+
+      # ==========================================================
+      # 📢 流程二：Telegram 通知推送
+      # ==========================================================
+      - name: 📢 推送通知至 Telegram
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
+            echo "⚠️ 未配置 Telegram 密钥，跳过推送。"
+            exit 0
+          fi
+
+          VERSIONS="${{ steps.package_prep.outputs.versions }}"
+          SOURCE_APK="${{ steps.package_prep.outputs.source_apk }}"
+          
+          MSG_CONTENT="无更新内容"
+          if [ -f "update.json" ]; then
+            MSG_CONTENT=$(jq -r '.msg // "无更新内容"' update.json)
+          fi
+          FINAL_CAPTION="📌 版本更新: $VERSIONS $MSG_CONTENT" 
+
+          if [ -f "$SOURCE_APK" ]; then
+            echo "正在发送文件到 Telegram..."
+            RESPONSE=$(curl -s -w "%{http_code}" --max-time 45 --connect-timeout 10 -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendDocument" \
+              -F chat_id="$TG_CHAT_ID" \
+              -F document=@"$SOURCE_APK" \
+              -F caption="$FINAL_CAPTION" || echo "000")
+            
+            HTTP_STATUS="${RESPONSE: -3}"
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+               echo "✅ Telegram 推送成功！"
+            else
+               echo "⚠️ Telegram 推送失败或超时，HTTP 状态码: $HTTP_STATUS，已自动忽略..."
+            fi
+          fi
+
+      # ==========================================================
+      # 🚀 流程三：独立发布 GitHub Releases 与附件挂载至目标仓库
+      # ==========================================================
+      - name: 🚀 发布 GitHub Release 与附件挂载至目标仓库
+        env:
+          GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+          REPO: "${{ env.DEFAULT_REPO }}"
+        run: |
+          set -e
+          TAG_NAME="${{ steps.package_prep.outputs.tag_name }}"
+          VERSIONS="${{ steps.package_prep.outputs.versions }}"
+          APK_FILENAME="${{ steps.package_prep.outputs.apk_filename }}"
+          SOURCE_FILENAME="${{ steps.package_prep.outputs.source_filename }}"
+
+          echo "正在向目标仓库 ($REPO) 发布 GitHub Release (Tag: $TAG_NAME)..."
+          NOTES="📌 **KGulu 自动构建发布**\n* **应用版本**: \`$VERSIONS\`"
+          
+          if gh release view "$TAG_NAME" --repo "$REPO" &>/dev/null; then
+            gh release upload "$TAG_NAME" "${APK_FILENAME}" "${SOURCE_FILENAME}" --repo "$REPO" --clobber
+            gh release edit "$TAG_NAME" --repo "$REPO" --title "KGulu 发布 $VERSIONS" --notes "$NOTES"
+          else
+            gh release create "$TAG_NAME" "${APK_FILENAME}" "${SOURCE_FILENAME}" \
+              --repo "$REPO" \
+              --title "KGulu 发布 $VERSIONS" \
+              --notes "$NOTES"
+          fi
+          echo "✅ 目标仓库 GitHub Release 发布及附件上传成功！"
+
+      # ==========================================================
+      # 📝 流程四：仅生成并 API 直传 update.json 至目标仓库
+      # ==========================================================
+      - name: 📝 仅生成并上传 update.json 至目标仓库 release 目录
+        env:
+          GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+          REPO: "${{ env.DEFAULT_REPO }}"
+          RELEASE_BASE_URL: "${{ env.RELEASE_BASE_URL }}"
+        run: |
+          set -e
+          APK_FILENAME="${{ steps.package_prep.outputs.apk_filename }}"
+          VERSION_NAME="${{ steps.package_prep.outputs.version_name }}"
+          VERSION_CODE="${{ steps.package_prep.outputs.version_code }}"
+          TAG_NAME="${{ steps.package_prep.outputs.tag_name }}"
+          SOURCE_FILENAME="${{ steps.package_prep.outputs.source_filename }}"
+          APK_URL="${RELEASE_BASE_URL%/}/${TAG_NAME}/${APK_FILENAME}"
+          ZIP_URL="${RELEASE_BASE_URL%/}/${TAG_NAME}/${SOURCE_FILENAME}"
+          # 1. 动态生成/更新 update.json
+          if [ -f "update.json" ]; then
+            TEMP_JSON=$(jq \
+              --arg url "${APK_URL}" \
+              --arg zip "${ZIP_URL}" \
+              --arg ver "${VERSION_NAME}/${VERSION_CODE}" \
+              '.url = $url | .version = $ver | .code = (.code // 200)' update.json)
+            echo "$TEMP_JSON" > update.json
+          else
+            jq -n \
+              --arg url "${APK_URL}" \
+              --arg ver "${VERSION_NAME}/${VERSION_CODE}" \
+              '{code: 200, url: $url, version: $ver, msg: "更新内容自动生成"}' > update.json
+          fi
+          echo "✅ update.json 生成成功！"
+
+          # 2. 原生 curl 上传函数封装
+          upload_via_curl() {
+            local local_path="$1"
+            local remote_path="$2"
+            
+            if [ ! -f "$local_path" ]; then
+              echo "❌ 本地文件不存在: $local_path"
+              return 1
+            fi
+
+            echo "正在通过 API 上传到目标仓库: $remote_path"
+            local api_url="https://api.github.com/repos/${REPO}/contents/${remote_path}"
+            
+            local sha=""
+            local sha_resp
+            sha_resp=$(curl -s -L -X GET "$api_url" \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: Actions-Uploader")
+            
+            if grep -q '"sha":' <<< "$sha_resp"; then
+              sha=$(echo "$sha_resp" | grep -o '"sha": *"[^"]*"' | head -1 | cut -d'"' -f4)
+            fi
+
+            local b64_content
+            b64_content=$(base64 -w 0 "$local_path")
+
+            local payload
+            if [ -n "$sha" ]; then
+              payload=$(jq -n \
+                --arg msg "API Upload: $remote_path" \
+                --arg content "$b64_content" \
+                --arg sha "$sha" \
+                '{message: $msg, content: $content, sha: $sha}')
+            else
+              payload=$(jq -n \
+                --arg msg "API Upload: $remote_path" \
+                --arg content "$b64_content" \
+                '{message: $msg, content: $content}')
+            fi
+
+            local http_code
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$api_url" \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: Actions-Uploader" \
+              -H "Content-Type: application/json" \
+              -d "$payload")
+
+            if [ "$http_code" -eq 200 ] || [ "$http_code" -eq 201 ]; then
+              echo "✅ 成功上传: $remote_path (HTTP $http_code)"
+            else
+              echo "⚠️ API 上传遇到问题: $remote_path -> HTTP $http_code"
+            fi
+          }
+
+          # 3. 仅通过 API 上传 update.json 到目标仓库的 release/update.json
+          upload_via_curl "update.json" "release/update.json"
+          echo "✅ update.json 已成功通过 API 上传至目标仓库的 release 目录！"
