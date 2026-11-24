@@ -1,0 +1,72 @@
+name: 🚨 一键清空当前仓库所有 Commit 历史
+
+on:
+  workflow_dispatch:
+    inputs:
+      secret_password:
+        description: '🔐 安全口令（必须输入正确密码才能清空历史）'
+        required: true
+        default: ''
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reset-history:
+    name: Reset Current Repo History
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: 验证安全口令
+        env:
+          INPUT_PWD: "${{ github.event.inputs.secret_password }}"
+          REAL_PWD: "${{ secrets.WORKFLOW_RUN_PASSWORD }}"
+        run: |
+          if [ -z "$INPUT_PWD" ] || [ "$INPUT_PWD" != "$REAL_PWD" ]; then
+            echo "❌ 错误: 运行口令不正确！安全机制触发，重置操作已终止。"
+            exit 1
+          else
+            echo "✅ 口令验证通过，准备清空当前仓库的 Git 历史..."
+          fi
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 删除 .git 并重新初始化仓库
+        run: |
+          set -e
+          
+          # 配置 Bot 身份
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.io"
+          
+          CURRENT_BRANCH="${GITHUB_REF_NAME:-main}"
+          echo "当前操作的分支是: ${CURRENT_BRANCH}"
+
+          # 1. 彻底删掉原有的 .git 目录（历史记录全没了）
+          rm -rf .git
+
+          # 2. 重新初始化一个全新的空仓库
+          git init
+          git checkout -B "$CURRENT_BRANCH"
+
+          # 3. 把当前所有文件重新添加进来
+          git add -A
+
+          # 4. 做成第一条全新的初始提交
+          git commit -m "clear commit"
+
+          # 5. 关联远程仓库并强推覆盖
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.REPOSITORY }}.git"
+
+          echo "正在强推覆盖远程仓库..."
+          git push -f origin "$CURRENT_BRANCH"
+
+          echo "🎉 成功！当前仓库 (${{ github.REPOSITORY }}) 的所有历史 Commit 已被彻底清空并重新初始化！"

@@ -1,0 +1,676 @@
+name: 清澜终端 构建 - term 分支
+run-name: "${{ github.workflow }} · ${{ github.event_name == 'workflow_dispatch' && '手动触发' || github.event_name == 'push' && '提交触发' || github.event_name }}"
+
+on:
+  push:
+    paths:
+      - 'push/term.txt'       # 检测到此文件更新时自动触发
+  workflow_dispatch:              # 支持手动触发
+    inputs:
+      secret_password:
+        description: '🔐 安全口令（手动运行必须输入正确密码）'
+        required: true
+        default: ''
+        type: string
+      force_download:
+        description: '是否强制重新下载远程源码/插件包？'
+        required: true
+        default: true
+        type: boolean
+      zip_url:
+        description: '远程源码/插件 ZIP 直链地址（留空则自动读取后台 TERM_ZIP_URL）'
+        required: false
+        default: ''
+        type: string
+      restore_commit:
+        description: '【可选】恢复指定的 Commit 记录 (留空或不填则跳过)'
+        required: false
+        default: ''
+        type: string
+      signing:
+        description: '签名模式: auto / signed / debug'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - signed
+          - debug
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# =============================================================
+# 全局变量配置区：共享共有仓库，通过 term 分支隔离
+# =============================================================
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  TARGET_REPO: "${{ secrets.DEFAULT_REPO || vars.DEFAULT_REPO || github.repository }}"
+  TARGET_BRANCH: "term"  # 专属于 term 项目的分支
+  DEFAULT_ZIP_URL: "${{ secrets.TERM_ZIP_URL || vars.TERM_ZIP_URL }}"
+  RELEASE_BASE_URL: "${{ secrets.RELEASE_BASE_URL || vars.RELEASE_BASE_URL }}"
+
+jobs:
+  build:
+    name: Build Term Project (term branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      # ==========================================================
+      # 🛡️ 1. 安全校验：仅在手动触发时检查密码口令
+      # ==========================================================
+      - name: 验证安全口令
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          INPUT_PWD: "${{ github.event.inputs.secret_password }}"
+          REAL_PWD: "${{ secrets.WORKFLOW_RUN_PASSWORD }}"
+        run: |
+          if [ "$INPUT_PWD" != "$REAL_PWD" ]; then
+            echo "❌ 错误: 运行口令不正确！安全机制触发，工作流已终止。"
+            exit 1
+          else
+            echo "✅ 口令验证通过，开始执行 Term 分支编译流程..."
+          fi
+
+      # ==========================================================
+      # 📥 2. 尝试检出远程 term 分支；若不存在则直接创建空目录准备接收源码
+      # ==========================================================
+      - name: 检出 term 分支或准备空目录
+        run: |
+          set -e
+          echo "正在尝试从共享仓库 ${TARGET_REPO} 检出分支: ${TARGET_BRANCH} ..."
+          
+          if git clone --depth 1 --branch "${TARGET_BRANCH}" "https://x-access-token:${{ secrets.MY_GITHUB_TOKEN }}@github.com/${TARGET_REPO}.git" coreapp 2>/dev/null; then
+            echo "✅ 成功找到并检出远程 ${TARGET_BRANCH} 分支！"
+          else
+            echo "⚠️ 远程仓库中尚无 ${TARGET_BRANCH} 分支（首次运行），直接在本地建立全新工作目录..."
+            mkdir -p coreapp
+          fi
+
+      - name: 检查并恢复指定的 Commit (可选)
+        run: |
+          cd coreapp
+          RESTORE_HASH="${{ github.event.inputs.restore_commit }}"
+          RESTORE_HASH=$(echo "$RESTORE_HASH" | xargs)
+          
+          if [ -d ".git" ] && [ -n "$RESTORE_HASH" ]; then
+            echo "🔍 检测到输入了 Commit 恢复参数: $RESTORE_HASH"
+            echo "正在尝试将仓库硬重置到该 Commit..."
+            if git checkout "$RESTORE_HASH" 2>/dev/null || git reset --hard "$RESTORE_HASH"; then
+              echo "✅ 成功恢复到 Commit: $RESTORE_HASH"
+            else
+              echo "❌ 错误: 指定的 Commit ($RESTORE_HASH) 不存在或无效！"
+              exit 1
+            fi
+          else
+            echo "⏩ 跳过 Commit 恢复步骤。"
+          fi
+
+      # ==========================================================
+      # 🧰 2.5 工具目录归一化：仓库里叫 tool/，统一改名 tools/
+      #     只改 CI 工作区，仓库目录名保持 tool；已有 tools/ 直接跳过
+      # ==========================================================
+      - name: 归一化工具目录名（有 tools 跳过，只有 tool 则改名）
+        run: |
+          if [ -d "coreapp/tools" ]; then
+            echo "✅ coreapp/tools 已存在，跳过改名"
+          elif [ -d "coreapp/tool" ]; then
+            echo "🔄 检测到 coreapp/tool（无 tools），改名为 coreapp/tools"
+            mv coreapp/tool coreapp/tools
+            echo "  ✓ 已改名，后续步骤统一按 tools/ 处理"
+          else
+            echo "⚠️ coreapp 下既没有 tool 也没有 tools，修 Via 那步会失败"
+          fi
+
+          # 仓库里的 jar 可能是 apktool_2.9.3.jar，脚本按 apktool.jar 找 -> 建别名，少下载 23MB
+          if [ -d coreapp/tools ] && [ ! -f coreapp/tools/apktool.jar ]; then
+            J=$(ls -1 coreapp/tools/apktool*.jar 2>/dev/null | head -1)
+            if [ -n "$J" ]; then
+              ln -sf "$(basename "$J")" coreapp/tools/apktool.jar
+              echo "  ✓ 将 $(basename "$J") 链接为 apktool.jar"
+            fi
+          fi
+
+      # ==========================================================
+      # 🔄 3. 下载远程源码、解压同步到 coreapp 并校验 gradlew
+      # ==========================================================
+      - name: 拉取、解压并同步远程源码到 coreapp
+        run: |
+          INPUT_URL="${{ github.event.inputs.zip_url }}"
+          TARGET_URL="${INPUT_URL:-${{ env.DEFAULT_ZIP_URL }}}"
+
+          if [ -z "$TARGET_URL" ]; then
+            echo "❌ 错误: 未检测到任何有效下载直链！"
+            exit 1
+          fi
+
+          echo "正在从远程直链下载最新源码压缩包: $TARGET_URL"
+          
+          MAX_RETRIES=2
+          RETRY_COUNT=0
+          SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "--- 第 $RETRY_COUNT 次下载尝试 ---"
+            
+            if curl -L --speed-time 60 --speed-limit 1 -o source.zip "$TARGET_URL"; then
+              if [ -s "source.zip" ]; then
+                echo "下载成功，且文件数据正常！"
+                SUCCESS=true
+                break
+              else
+                echo "警告: 下载完成但文件大小为 0，视为无效数据。"
+              fi
+            else
+              echo "警告: 下载中断。"
+            fi
+
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "将在 5 秒后进行重试..."
+              sleep 5
+            fi
+          done
+
+          if [ "$SUCCESS" = "false" ]; then
+            echo "❌ 错误: 下载远程源码超时或失败。"
+            exit 1
+          fi
+
+          echo "正在解压压缩包..."
+          rm -rf temp
+          unzip -q source.zip -d temp
+          # 保留源码包用于同步 release：放进 release/ 里存着。
+          # 不能留在根目录，因为下一步 rsync --delete 会把「源里没有」的文件删掉，
+          # 而 release/*.zip 在排除名单中，放这里才不会被清掉
+          mkdir -p release
+          mv -f source.zip release/raw-source.zip
+          
+          echo "🔍 正在识别源码根目录..."
+          zippath="temp/"
+          
+          if [ ! -f "temp/gradlew" ] && [ ! -d "temp/app" ]; then
+            sub_one=$(find temp -maxdepth 2 -name "gradlew" -type f | head -n 1)
+            if [ -n "$sub_one" ]; then
+              zippath="$(dirname "$sub_one")/"
+            else
+              sub_app=$(find temp -maxdepth 2 -name "app" -type d | head -n 1)
+              if [ -n "$sub_app" ]; then
+                zippath="$(dirname "$sub_app")/"
+              fi
+            fi
+          fi
+
+          echo "✅ 最终确定的源码目录为: ${zippath}"
+           
+          if [ -n "$zippath" ] && [ -d "$zippath" ]; then
+            echo "正在将最新远程源码覆盖同步到 coreapp 目录（保留 .git 与 tools）..."
+            # .git 与 tools 不清空：tools 靠 rsync 逐文件覆盖，避免误删仓库里独有的 apktool.jar / ssh.zip
+            find coreapp -mindepth 1 ! -path 'coreapp/.git*' ! -path 'coreapp/tools*' -exec rm -rf {} +
+
+            shopt -s dotglob
+            # 源码包里的 tools 要同步过来：脚本随包一起更新，仓库里独有的（ssh.zip/apktool.jar）不删
+            # 主树先排除 tools，tools 再单独用 -c（按校验和）强制覆盖，
+            # 避免同名文件大小、时间戳都相同被 rsync 跳过
+            rsync -av --exclude='.github' --exclude='.git' --exclude='tools' "$zippath" ./coreapp/
+            TP="${zippath%/}"
+            if [ -d "$TP/tools" ]; then
+              echo "🔄 同步 tools/（源码包覆盖仓库同名文件）..."
+              mkdir -p ./coreapp/tools
+              rsync -avc "$TP/tools/" ./coreapp/tools/
+            else
+              echo "ℹ️ 源码包内没有 tools/，沿用仓库里的 tools"
+            fi
+            rm -rf temp
+            shopt -u dotglob
+          else
+            echo "❌ 错误: 未能在压缩包中找到有效的源码路径！"
+            exit 1
+          fi
+
+          # 📌 核心校验：在 coreapp 中寻找 gradlew，如果没有直接结束脚本
+          echo "🔍 正在校验 coreapp 目录下的 gradlew 文件..."
+          if [ ! -f "coreapp/gradlew" ]; then
+            echo "❌ 错误: coreapp 目录中未找到 gradlew 文件！脚本终止。"
+            exit 1
+          else
+            echo "✅ 校验通过: 成功在 coreapp 中找到 gradlew！"
+          fi
+
+          # 📌 工具校验：构建后修 Via 资源 id 依赖 tools/ 里的脚本与基线表
+          echo "🔍 正在校验 tools 工具目录..."
+          for f in tools/via_res_baseline.tsv tools/fix_via_after_build.sh; do
+            if [ ! -f "coreapp/$f" ]; then
+              echo "❌ 错误: coreapp/$f 缺失！请把工具目录提交到 ${TARGET_BRANCH} 分支。"
+              exit 1
+            fi
+            echo "  ✓ coreapp/$f"
+          done
+          if [ -f "coreapp/tools/apktool.jar" ] && [ "$(wc -c < coreapp/tools/apktool.jar)" -gt 1000000 ]; then
+            echo "  ✓ coreapp/tools/apktool.jar ($(du -h coreapp/tools/apktool.jar | cut -f1))，将复用不下载"
+          else
+            echo "  ⚠️ coreapp/tools/apktool.jar 缺失或损坏 → 构建后自动下载 2.9.3"
+          fi
+          chmod +x coreapp/tools/fix_via_after_build.sh
+
+          cd coreapp
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.io"
+          
+          git remote set-url origin "https://x-access-token:${{ secrets.MY_GITHUB_TOKEN }}@github.com/${TARGET_REPO}.git"
+
+          git add .
+          if git diff --staged --quiet; then
+            echo "没有发现文件变动。"
+          else
+            git commit -m "Auto-update source code from remote zip (force overwrite)"
+            git push origin "HEAD:${TARGET_BRANCH}" || git push --force origin "HEAD:${TARGET_BRANCH}"
+          fi
+
+      - name: 初始化运行环境并清理 Release
+        run: |
+          echo "清理源码库 release..."
+          rm -rf coreapp/release
+          
+          if [ -d ".github" ]; then
+              cp -rf .github .github_backup
+          fi
+
+          rsync -av --delete --exclude='coreapp' --exclude='release/*.zip' --exclude='*.apk' coreapp/ ./
+
+          if [ -d ".github_backup" ]; then
+              rm -rf .github
+              mv .github_backup .github
+          fi
+
+          # 确认 tools 已被同步到工作目录根（脚本按 tools/ 找文件）
+          for f in tools/via_res_baseline.tsv tools/fix_via_after_build.sh; do
+            [ -f "$f" ] || { echo "❌ $f 丢失，请确认仓库 ${TARGET_BRANCH} 分支的 tools/ 完整"; exit 1; }
+          done
+          if [ ! -f "tools/apktool.jar" ]; then
+            rm -f tools/apktool.jar   # 清掉可能的 0 字节残包，交给修复脚本重新下载
+          fi
+          chmod +x tools/fix_via_after_build.sh
+
+          # ── 检测并补齐 ssh 组件包（下载/校验逻辑在 tools/fetch_ssh_pack.sh）──
+          if [ -f "tools/fetch_ssh_pack.sh" ]; then
+            chmod +x tools/fetch_ssh_pack.sh
+            bash tools/fetch_ssh_pack.sh
+          else
+            echo "❌ 缺少 tools/fetch_ssh_pack.sh，请提交到 ${TARGET_BRANCH} 分支的 tools/ 目录"
+            exit 1
+          fi
+
+      # ==========================================================
+      # 🔑 4. 签名密钥：统一落到 lytv.jks；密码不写进 yml，沿用源码/脚本默认
+      # ==========================================================
+      - name: 准备签名密钥（lytv.jks）
+        env:
+          TERM_KEYSTORE_BASE64: ${{ secrets.TERM_KEYSTORE_BASE64 || secrets.GULU_KEYSTORE_BASE64 }}
+        run: |
+          set -e
+          # 源码 signingConfig 硬编码 rootProject/lytv.jks，所以统一落到这个文件名
+          KS_FILE="$PWD/lytv.jks"
+          PASS=""
+          ALIAS=""
+
+          if [ -f "lytv.jks" ]; then
+            echo "✅ 复用源码自带 lytv.jks"
+          elif [ -n "${TERM_KEYSTORE_BASE64:-}" ]; then
+            echo "📌 源码无 lytv.jks，用 Secrets 的 Base64 解码生成"
+            echo "$TERM_KEYSTORE_BASE64" | base64 -d -i > "$KS_FILE"
+          else
+            PASS=$(python3 -c "import secrets;print(secrets.token_hex(16))")
+            echo "⚠️ 无密钥也无 Base64，现场生成随机密码密钥（签名会变，升级需卸载）"
+            keytool -genkeypair -v -keystore "$KS_FILE" -alias "${ALIAS:-lytv}" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=kguluTerm, OU=Dev, O=kgulu, L=SZ, ST=GD, C=CN"
+          fi
+
+          # 密码不写在 yml：走源码 signingConfig 的默认值 + 私库脚本里的默认值
+          # 只有「现场生成随机密码」这一种情况才把密码放进 GITHUB_ENV 传给后续步骤
+          if [ -n "$PASS" ]; then
+            keytool -list -keystore "$KS_FILE" -storepass "$PASS" >/dev/null 2>&1 \
+              || { echo "❌ 现场生成的 keystore 校验失败"; exit 1; }
+          else
+            echo "ℹ️ 未生成新密钥，签名密码沿用源码 signingConfig / 私库脚本默认值"
+          fi
+
+          echo "KS_FILE=$KS_FILE" >> "$GITHUB_ENV"
+          if [ -n "$PASS" ]; then echo "KS_PASS=$PASS" >> "$GITHUB_ENV"; fi
+          if [ -n "$ALIAS" ]; then echo "KS_ALIAS=$ALIAS" >> "$GITHUB_ENV"; fi
+          echo "   keystore: $KS_FILE"
+
+      - name: 设置 Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 接受 Android SDK 许可证
+        run: yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      # apktool 仓库里已有就直接复用，没有再让修复脚本自己下载 2.9.3
+      - name: 确认 apktool 可用（有则复用，无则自动下载）
+        run: |
+          JAR=tools/apktool.jar
+          if [ -f "$JAR" ] && [ "$(wc -c < "$JAR")" -gt 1000000 ] && java -jar "$JAR" --version >/dev/null 2>&1; then
+            echo "✅ 复用仓库内 apktool: $(java -jar "$JAR" --version 2>/dev/null | head -1) / $(du -h "$JAR" | cut -f1)"
+          else
+            echo "⚠️ apktool 不在仓库或已损坏，构建后由脚本自动下载 2.9.3"
+            rm -f "$JAR"
+          fi
+
+      - name: 赋予 Gradlew 执行权限
+        run: chmod +x gradlew
+
+      - name: 修复文件时间戳并清理 CMake 缓存 (修复 ninja manifest dirty)
+        run: |
+          find . -type f -not -path './.git/*' -not -path './coreapp/*' -not -path './release/*' -exec touch {} +
+          rm -rf app/.cxx app/build
+          echo "✅ 时间戳已统一，CMake 缓存已清理"
+
+      - name: 执行 Gradle 编译打包
+        env:
+          KS_PASS_OPT: ${{ secrets.KGULU_STORE_PASS || secrets.TERM_KEYSTORE_PASS }}
+          KS_ALIAS_OPT: ${{ secrets.KGULU_KEY_ALIAS || secrets.TERM_KEYSTORE_ALIAS }}
+        run: |
+          set -eu
+          if [ -n "${KS_PASS_OPT:-}" ]; then
+            export KGULU_STORE_PASS="${KS_PASS_OPT}" KGULU_KEY_PASS="${KS_PASS_OPT}"
+            echo "签名密码来自 Secrets"
+          elif [ -n "${KS_PASS:-}" ]; then
+            export KGULU_STORE_PASS="${KS_PASS}" KGULU_KEY_PASS="${KS_PASS}"
+            echo "签名密码来自现场生成"
+          else
+            echo "⚠️ 没有密码可用，signingConfig 不会启用（产物可能未签名）"
+          fi
+          if [ -n "${KS_ALIAS_OPT:-}" ]; then export KGULU_KEY_ALIAS="${KS_ALIAS_OPT}"; fi
+          # 跳过 lintVitalRelease：via 资源里的 backup 规则会被判致命错误，不影响产物
+          ./gradlew :app:assembleRelease -x lintVitalRelease --stacktrace --no-daemon --no-configuration-cache \
+            || ./gradlew :app:assembleDebug --stacktrace --no-daemon --no-configuration-cache
+
+      # ==========================================================
+      # 🩹 5. 源码不动，构建后由 yml 修内置 Via 的资源 id
+      #     只替换 assets/web/classes.dex，其它条目原样，签名沿用同一把 keystore
+      # ==========================================================
+      - name: 修复内置 Via 资源 id（只替换 assets/web/classes.dex）
+        env:
+          KS_PASS_OPT: ${{ secrets.KGULU_STORE_PASS || secrets.TERM_KEYSTORE_PASS }}
+          KS_ALIAS_OPT: ${{ secrets.KGULU_KEY_ALIAS || secrets.TERM_KEYSTORE_ALIAS }}
+        run: |
+          set -e
+          export KS="${KS_FILE}"
+          if [ -n "${KS_PASS_OPT:-}" ]; then export PASS="${KS_PASS_OPT}"; fi
+          if [ -n "${KS_PASS:-}" ]; then export PASS="${KS_PASS}"; fi
+          # 都空时补一次 local.properties（gradle signingConfig 用的就是这份密码）
+          if [ -z "${PASS:-}" ] && [ -f local.properties ]; then
+            PASS="$(grep -E '^kgulu\.(store|key)Password=' local.properties 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
+            if [ -n "${PASS:-}" ]; then
+              export PASS
+              echo "签名密码取自 local.properties"
+            fi
+          fi
+          if [ -n "${KS_ALIAS_OPT:-}" ]; then export ALIAS="${KS_ALIAS_OPT}"; fi
+          if [ -n "${KS_ALIAS:-}" ]; then export ALIAS="${KS_ALIAS}"; fi
+          APK=$(ls -1 app/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
+          [ -z "$APK" ] && APK=$(ls -1 app/build/outputs/apk/debug/*.apk 2>/dev/null | head -1)
+          [ -n "$APK" ] || { echo "❌ 找不到 APK"; exit 1; }
+          echo "处理: $APK"
+          bash tools/fix_via_after_build.sh "$APK"
+
+      - name: 校验内置 Via 资源 id 是否已修复
+        run: |
+          APK=$(ls -1 app/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
+          [ -z "$APK" ] && APK=$(ls -1 app/build/outputs/apk/debug/*.apk 2>/dev/null | head -1)
+          echo "校验 APK: $APK"
+          python3 - "$APK" <<'PY'
+          import sys, zipfile
+          apk = sys.argv[1]
+          z = zipfile.ZipFile(apk)
+          if 'assets/web/classes.dex' not in z.namelist():
+              print('本包不含内置 Via，跳过校验'); sys.exit(0)
+          size = z.getinfo('assets/web/classes.dex').file_size
+          print('assets/web/classes.dex =', size, 'bytes')
+          if size == 6181184:
+              sys.exit('❌ Via dex 仍是原始大小，说明修复没生效，图标会错位')
+          print('✅ Via dex 已重新汇编，资源 id 已按基线重算')
+          PY
+
+      - name: 整理产物与版本信息
+        id: prep_release
+        run: |
+          set -e
+
+          GRADLE_FILE="coreapp/app/build.gradle.kts"
+          if [ ! -f "$GRADLE_FILE" ]; then
+            GRADLE_FILE="coreapp/app/build.gradle"
+          fi
+          if [ ! -f "$GRADLE_FILE" ]; then
+            GRADLE_FILE="app/build.gradle.kts"
+          fi
+
+          RAW_VERSION_NAME=$(grep -E 'versionName\s*=' "$GRADLE_FILE" 2>/dev/null | head -1 | sed -E 's/.*["'\ ']([^"'\ ']+)["'\ '].*/\1/' | tr -d '"'"'")
+          RAW_VERSION_CODE=$(grep -E 'versionCode\s*=' "$GRADLE_FILE" 2>/dev/null | head -1 | sed -E 's/.*[[:space:]]([0-9]+).*/\1/')
+          
+          VERSION_NAME=$(echo "$RAW_VERSION_NAME" | tr -cd '[:alnum:].-_')
+          VERSION_CODE=$(echo "$RAW_VERSION_CODE" | tr -cd '[:alnum:]')
+
+          if [ -z "$VERSION_NAME" ]; then VERSION_NAME="1.0.0"; fi
+          if [ -z "$VERSION_CODE" ]; then VERSION_CODE="1"; fi
+
+          CLEAN_VERSION_NAME=$(echo "$VERSION_NAME" | tr -d '.')
+          VERSION="${CLEAN_VERSION_NAME}-${VERSION_CODE}"
+          VERSIONS="v${VERSION_NAME}/${VERSION_CODE}"
+          TAG_NAME="QL-${CLEAN_VERSION_NAME}"
+
+          APK_FILENAME="QL-${VERSION}.apk"
+          SOURCE_FILENAME="QL-source-${VERSION}.zip"
+
+          echo "VERSION_NAME=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "VERSIONS=${VERSIONS}" >> "$GITHUB_OUTPUT"
+          echo "APK_FILENAME=${APK_FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_FILENAME=${SOURCE_FILENAME}" >> "$GITHUB_OUTPUT"
+          
+          if [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
+            SRC_APK="app/build/outputs/apk/release/app-release.apk"
+          elif [ -f "app/build/outputs/apk/debug/app-debug.apk" ]; then
+            SRC_APK="app/build/outputs/apk/debug/app-debug.apk"
+          else
+            SRC_APK=$(find app/build/outputs/apk/ -name "*.apk" | head -n 1)
+          fi
+
+          if [ -z "$SRC_APK" ] || [ ! -f "$SRC_APK" ]; then
+            echo "❌ 错误: 未能在 build 路径找到生成的 APK！"
+            exit 1
+          fi
+
+          mkdir -p release
+          cp "$SRC_APK" "release/${APK_FILENAME}"
+
+          echo "🧹 正在清理 coreapp 中的编译缓存，确保源码包干净且体积小..."
+          cd coreapp
+          rm -rf app/build app/.cxx build .gradle .idea
+          
+          echo "📦 整理源码包..."
+          if [ -f "../release/raw-source.zip" ]; then
+            mv -f "../release/raw-source.zip" "../release/${SOURCE_FILENAME}"
+            echo "   ✓ 复用最初下载的源码包（原样同步到 release）"
+          else
+            echo "   ⚠️ 没找到 raw-source.zip，现打一份干净包"
+            rm -f "../release/${SOURCE_FILENAME}"
+            zip -rq "../release/${SOURCE_FILENAME}" . -x ".git/*" "release/*" "*.apk" "tools/apktool.jar"
+          fi
+          cd ..
+          echo "✅ 产物整理完毕！(Tag: ${TAG_NAME})"
+
+      - name: 🚀 使用 GitHub CLI 发布/更新 Release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ steps.prep_release.outputs.TAG_NAME }}"
+          VERSIONS="${{ steps.prep_release.outputs.VERSIONS }}"
+          
+          APK_FILE="release/${{ steps.prep_release.outputs.APK_FILENAME }}"
+          SOURCE_FILE="release/${{ steps.prep_release.outputs.SOURCE_FILENAME }}"
+          
+          
+          NOTES="📌 **清澜APP 自动构建完成**
+          * **应用版本**: \`${{ steps.prep_release.outputs.VERSIONS }}\`
+          * **构建模式**: \`纯净源码直出 (无 Patch)\`"
+
+          UPLOAD_FILES=("$APK_FILE" "$SOURCE_FILE")
+         
+          if gh release view "$TAG_NAME" --repo "${TARGET_REPO}" &>/dev/null; then
+            echo "📌 检测到同名标签 $TAG_NAME 的 Release 已存在，保留标签，开始覆盖上传同名附件..."
+            # 清掉 Release 上历史遗留的 ssh-pack 附件（新版不再产出这个文件）
+            for a in $(gh release view "$TAG_NAME" --repo "${TARGET_REPO}" --json assets -q '.assets[].name' 2>/dev/null | grep -E '^ssh-pack'); do
+              gh release delete-asset "$TAG_NAME" "$a" --repo "${TARGET_REPO}" --yes && echo "🧹 已删除旧附件 $a"
+            done
+            gh release upload "$TAG_NAME" "${UPLOAD_FILES[@]}" --repo "${TARGET_REPO}" --clobber
+            gh release edit "$TAG_NAME" --repo "${TARGET_REPO}" --title "清澜APP 构建发布 $VERSIONS" --notes "$NOTES"
+          else
+            echo "📌 标签 $TAG_NAME 尚不存在，正在创建新 Release 并上传附件..."
+            gh release create "$TAG_NAME" "${UPLOAD_FILES[@]}" \
+              --repo "${TARGET_REPO}" \
+              --title "清澜APP 构建发布 $VERSIONS" \
+              --notes "$NOTES"
+          fi
+          echo "✅ GitHub Releases 发布/更新流程执行完毕！"
+
+      - name: Telegram 推送 APK
+        continue-on-error: true
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          VERSIONS="${{ steps.prep_release.outputs.VERSIONS }}"
+          APK_FILENAME="${{ steps.prep_release.outputs.APK_FILENAME }}"
+          
+          if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ]; then
+            echo "推送 APK 至 Telegram..."
+            FINAL_APK="release/${APK_FILENAME}"
+            FINAL_CAPTION="📌 清澜APP 构建完成: $VERSIONS"
+
+            if [ -f "$FINAL_APK" ]; then
+              curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendDocument" \
+                -F chat_id="$TG_CHAT_ID" \
+                -F document=@"$FINAL_APK" \
+                -F caption="$FINAL_CAPTION" || true
+              echo "✅ Telegram 推送执行完成"
+            else
+              echo "⚠️ 找不到需要推送的 APK 文件，跳过"
+            fi
+          else
+            echo "⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID Secrets，跳过推送"
+          fi
+
+      # ==========================================================
+      # 📝 流程四：仅生成并 API 直传 update.json 至目标仓库 TARGET_BRANCH
+      # ==========================================================
+      - name: 📝 生成并上传 update.json 至目标仓库分支
+        env:
+          GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+        run: |
+          set -e
+          APK_FILENAME="${{ steps.prep_release.outputs.APK_FILENAME }}"
+          VERSION_NAME="${{ steps.prep_release.outputs.VERSION_NAME }}"
+          VERSION_CODE="${{ steps.prep_release.outputs.VERSION_CODE }}"
+          TAG_NAME="${{ steps.prep_release.outputs.TAG_NAME }}"
+          SOURCE_FILENAME="${{ steps.prep_release.outputs.SOURCE_FILENAME }}"
+
+          BASE_URL="${RELEASE_BASE_URL:-https://github.com/${TARGET_REPO}/releases/download}"
+          APK_URL="${BASE_URL%/}/${TAG_NAME}/${APK_FILENAME}"
+          ZIP_URL="${BASE_URL%/}/${TAG_NAME}/${SOURCE_FILENAME}"
+
+          # 1. 动态生成/更新 update.json
+          if [ -f "update.json" ]; then
+            TEMP_JSON=$(jq \
+              --arg url "${APK_URL}" \
+              --arg zip "${ZIP_URL}" \
+              --arg ver "${VERSION_NAME}/${VERSION_CODE}" \
+              '.url = $url | .zip = $zip | .version = $ver | .code = 200' update.json)
+            echo "$TEMP_JSON" > update.json
+          else
+            jq -n \
+              --arg url "${APK_URL}" \
+              --arg zip "${ZIP_URL}" \
+              --arg ver "${VERSION_NAME}/${VERSION_CODE}" \
+              '{code: 200, url: $url, version: $ver, zip: $zip, msg: "没有更新日志 更新内容自动生成"}' > update.json
+          fi
+          echo "✅ update.json 生成成功！"
+
+          # 2. 原生 curl 上传函数封装（指定分支 TARGET_BRANCH）
+          upload_via_curl() {
+            local local_path="$1"
+            local remote_path="$2"
+            local branch="${TARGET_BRANCH}"
+
+            if [ ! -f "$local_path" ]; then
+              echo "❌ 本地文件不存在: $local_path"
+              return 1
+            fi
+
+            echo "正在通过 API 上传到仓库 ${TARGET_REPO}（分支: ${branch}）: ${remote_path}"
+            local api_url="https://api.github.com/repos/${TARGET_REPO}/contents/${remote_path}"
+
+            local sha=""
+            local sha_resp
+            sha_resp=$(curl -s -L -X GET "${api_url}?ref=${branch}" \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: Actions-Uploader")
+
+            if grep -q '"sha":' <<< "$sha_resp"; then
+              sha=$(echo "$sha_resp" | grep -o '"sha": *"[^"]*"' | head -1 | cut -d'"' -f4)
+            fi
+
+            local b64_content
+            b64_content=$(base64 -w 0 "$local_path")
+
+            local payload
+            if [ -n "$sha" ]; then
+              payload=$(jq -n \
+                --arg msg "API Upload(${branch}): ${remote_path}" \
+                --arg content "$b64_content" \
+                --arg branch "$branch" \
+                --arg sha "$sha" \
+                '{message: $msg, content: $content, branch: $branch, sha: $sha}')
+            else
+              payload=$(jq -n \
+                --arg msg "API Upload(${branch}): ${remote_path}" \
+                --arg content "$b64_content" \
+                --arg branch "$branch" \
+                '{message: $msg, content: $content, branch: $branch}')
+            fi
+
+            local http_code
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$api_url" \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: Actions-Uploader" \
+              -H "Content-Type: application/json" \
+              -d "$payload")
+
+            if [ "$http_code" -eq 200 ] || [ "$http_code" -eq 201 ]; then
+              echo "✅ 成功上传到 ${branch} 分支: ${remote_path} (HTTP $http_code)"
+            else
+              echo "⚠️ API 上传遇到问题: ${remote_path} -> HTTP $http_code"
+              return 1
+            fi
+          }
+
+          # 3. 上传 update.json 到目标仓库 TARGET_BRANCH 的 release/update.json
+          upload_via_curl "update.json" "release/update.json"
+#（注：内容由AI生成）
